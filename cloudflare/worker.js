@@ -130,7 +130,7 @@ export default {
       ? {
           'access-control-allow-origin': origin,
           'access-control-allow-credentials': 'true',
-          'access-control-allow-headers': 'Content-Type, If-Match, Authorization, Range',
+          'access-control-allow-headers': 'Content-Type, If-Match, Authorization',
           'vary': 'Origin'
         }
       : {};
@@ -147,7 +147,7 @@ export default {
         headers: {
           ...cors,
           'access-control-allow-methods': 'GET,POST,PUT,OPTIONS',
-          'access-control-allow-headers': 'Content-Type, If-Match, Authorization, Range',
+          'access-control-allow-headers': 'Content-Type, If-Match, Authorization',
           'access-control-max-age': '600'
         }
       });
@@ -172,112 +172,22 @@ export default {
 
     try {
       // =========================================
-      // ADMIN VIDEO UPLOADS (R2 multipart, 8 MiB chunks, up to 500 MiB)
+      // SERVE MEDIA FROM R2
       // =========================================
-      const videoBucket = env.IMAGES || env.BUCKET || env.Bucket;
-      const videoMaxBytes = 500 * 1024 * 1024;
-      const videoPartMaxBytes = 8 * 1024 * 1024;
-      if (path.startsWith('/api/admin/videos/')) {
-        const user = await identity(req, env);
-        if (!user?.is_admin) return fail('رفع وإدارة الفيديوهات متاحان للإدارة فقط.', 401);
-        if (!videoBucket) return fail('تخزين R2 غير مهيأ على الخادم.', 503);
-        const action = path.split('/').pop();
-        if (req.method !== 'POST') return fail('طريقة الطلب غير مدعومة.', 405);
-        if (action === 'start') {
-          const b = await readBody(req);
-          const size = Number(b.size || 0);
-          const type = String(b.type || '');
-          const extByType = {'video/mp4':'mp4','video/webm':'webm','video/quicktime':'mov','video/ogg':'ogv'};
-          const ext = extByType[type];
-          if (!Number.isSafeInteger(size) || size < 1 || size > videoMaxBytes) return fail('حجم الفيديو يجب ألا يتجاوز 500MB.', 413);
-          if (!ext) return fail('صيغة الفيديو غير مدعومة. استخدم MP4 أو WebM أو MOV أو OGG.');
-          const key = 'videos/' + random() + '.' + ext;
-          const upload = await videoBucket.createMultipartUpload('media/' + key, {httpMetadata:{contentType:type,cacheControl:'public, max-age=31536000, immutable'}});
-          return reply({key,uploadId:upload.uploadId});
-        }
-        if (action === 'part') {
-          const u = new URL(req.url), key = u.searchParams.get('key') || '', uploadId = u.searchParams.get('uploadId') || '', partNumber = Number(u.searchParams.get('partNumber'));
-          const length = Number(req.headers.get('content-length') || 0);
-          if (!/^videos\/[a-f0-9]{64}\.(?:mp4|webm|mov|ogv)$/.test(key) || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) return fail('بيانات جزء الفيديو غير صالحة.');
-          if (!length || length > videoPartMaxBytes) return fail('حجم جزء الرفع غير صالح.', 413);
-          const upload = videoBucket.resumeMultipartUpload('media/' + key, uploadId);
-          const part = await upload.uploadPart(partNumber, req.body);
-          return reply({etag:part.etag,partNumber});
-        }
-        if (action === 'complete') {
-          const b = await readBody(req);
-          if (!/^videos\/[a-f0-9]{64}\.(?:mp4|webm|mov|ogv)$/.test(String(b.key||'')) || !b.uploadId || !Array.isArray(b.parts) || !b.parts.length || b.parts.length > 64) return fail('بيانات إكمال رفع الفيديو غير صالحة.');
-          const parts = b.parts.map(p=>({partNumber:Number(p.partNumber),etag:String(p.etag||'')}));
-          if (parts.some((p,i)=>!Number.isInteger(p.partNumber)||p.partNumber!==i+1||!p.etag)) return fail('ترتيب أجزاء الفيديو غير صالح.');
-          const upload = videoBucket.resumeMultipartUpload('media/' + b.key, b.uploadId);
-          const object = await upload.complete(parts);
-          const filename = b.key.split('/').pop();
-          return reply({success:true,key:b.key,id:filename,url:new URL('/api/media-video/' + filename,req.url).href,etag:object.httpEtag});
-        }
-        if (action === 'abort') {
-          const b = await readBody(req);
-          if (!/^videos\/[a-f0-9]{64}\.(?:mp4|webm|mov|ogv)$/.test(String(b.key||'')) || !b.uploadId) return fail('بيانات إلغاء الرفع غير صالحة.');
-          await videoBucket.resumeMultipartUpload('media/' + b.key,b.uploadId).abort();
-          return reply({success:true});
-        }
-        if (action === 'delete') {
-          const b = await readBody(req);
-          if (!/^videos\/[a-f0-9]{64}\.(?:mp4|webm|mov|ogv)$/.test(String(b.key||''))) return fail('معرّف الفيديو غير صالح.');
-          await videoBucket.delete('media/' + b.key);
-          return reply({success:true});
-        }
-        return fail('مسار إدارة الفيديو غير موجود.',404);
-      }
-
-      // =========================================
-      // SERVE IMAGES AND STREAMABLE VIDEO FROM R2
-      // =========================================
-      const imageMatch = path.match(/^\/api\/media\/([a-f0-9]{64}\.(?:png|jpeg|webp|gif))$/);
-      const videoMatch = path.match(/^\/api\/media-video\/([a-f0-9]{64}\.(?:mp4|webm|mov|ogv))$/);
-      if ((imageMatch || videoMatch) && req.method === 'GET') {
+      const mediaMatch = path.match(/^\/api\/media\/([a-f0-9]{64}\.(?:png|jpeg|webp|gif))$/);
+      if (mediaMatch && req.method === 'GET') {
         const bucket = env.IMAGES || env.BUCKET || env.Bucket;
-        if (!bucket) return fail('تخزين الملفات غير مهيأ على الخادم.', 503);
-        const key = imageMatch ? 'media/' + imageMatch[1] : 'media/videos/' + videoMatch[1];
-        const rangeHeader = req.headers.get('range');
-        let range = undefined, partial = false, rangeStart = 0, rangeEnd = 0;
-        if (rangeHeader) {
-          const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-          if (!match) return new Response(null,{status:416,headers:{...cors,'accept-ranges':'bytes'}});
-          partial = true;
-          if (match[1] === '') return fail('نطاق الفيديو غير صالح.',416);
-          rangeStart = Number(match[1]); rangeEnd = match[2] ? Number(match[2]) : rangeStart + 8*1024*1024 - 1;
-          if (!Number.isSafeInteger(rangeStart)||!Number.isSafeInteger(rangeEnd)||rangeEnd<rangeStart) return new Response(null,{status:416,headers:{...cors,'accept-ranges':'bytes'}});
-          range = {offset:rangeStart,length:rangeEnd-rangeStart+1};
-        }
-        const object = await bucket.get(key, range ? {range} : undefined);
-        if (!object) return fail('الملف غير موجود.',404);
-        const headers = new Headers({...cors,'cache-control':'public, max-age=31536000, immutable','x-content-type-options':'nosniff','accept-ranges':'bytes','etag':object.httpEtag});
-        object.writeHttpMetadata(headers);
-        if (req.headers.get('if-none-match') === object.httpEtag) return new Response(null,{status:304,headers});
-        if (partial) {
-          const size = object.size || (rangeEnd+1);
-          const end = Math.min(rangeEnd,size-1);
-          headers.set('content-range',`bytes ${rangeStart}-${end}/${size}`);
-          headers.set('content-length',String(end-rangeStart+1));
-          return new Response(object.body,{status:206,headers});
-        }
-        headers.set('content-length',String(object.size));
-        return new Response(object.body,{status:200,headers});
-      }
-
-      // =========================================
-      // PUBLIC SITE STATISTICS
-      // Returns the real number of registered accounts.
-      // Read-only endpoint: does not modify users or sessions.
-      // =========================================
-      if (path === '/api/statistics' && req.method === 'GET') {
-        const row = await env.DB.prepare(
-          'SELECT COUNT(*) AS users FROM users'
-        ).first();
-
-        return reply({
-          users: Number(row?.users || 0)
+        if (!bucket) return fail('تخزين الصور غير مهيأ على الخادم.', 503);
+        const object = await bucket.get('media/' + mediaMatch[1]);
+        if (!object) return fail('الصورة غير موجودة.', 404);
+        const headers = new Headers({
+          'cache-control': 'public, max-age=31536000, immutable',
+          'x-content-type-options': 'nosniff',
+          'etag': object.httpEtag
         });
+        object.writeHttpMetadata(headers);
+        if (req.headers.get('if-none-match') === object.httpEtag) return new Response(null, { status: 304, headers });
+        return new Response(object.body, { status: 200, headers });
       }
 
       // =========================================
