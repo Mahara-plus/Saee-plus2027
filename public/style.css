@@ -84,5 +84,3 @@ header nav .statistics-nav-button:focus-visible {
 [id*="made-with" i],[class*="made-with" i],[id*="branding-badge" i],[class*="branding-badge" i],
 [id*="powered-by" i],[class*="powered-by" i],a[href*="lovable.dev"],a[href*="v0.dev"],
 iframe[src*="watermark" i],iframe[title*="watermark" i]{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;width:0!important;height:0!important}
-
-/* About-page video upload and player styles */
