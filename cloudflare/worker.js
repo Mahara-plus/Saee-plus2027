@@ -93,6 +93,48 @@ async function identity(req, env) {
     .first();
 }
 
+let featureSchemaReady = false;
+async function ensureFeatureSchema(env) {
+  if (featureSchemaReady) return;
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS community_projects (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    field TEXT NOT NULL,
+    project_type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    image_url TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    contact TEXT NOT NULL DEFAULT '',
+    instagram_url TEXT NOT NULL DEFAULT '',
+    facebook_url TEXT NOT NULL DEFAULT '',
+    entity_name TEXT NOT NULL DEFAULT '',
+    placement TEXT NOT NULL DEFAULT 'projects',
+    status TEXT NOT NULL DEFAULT 'pending',
+    admin_note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    reviewed_at INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_community_projects_status_created ON community_projects(status, created_at DESC)').run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_community_projects_user ON community_projects(user_id, created_at DESC)').run();
+  featureSchemaReady = true;
+}
+
+const COMMUNITY_PLACEMENTS = new Set([
+  'projects',
+  'projects_opportunities',
+  'opportunities',
+  'opportunities_discounts'
+]);
+
+function validOptionalUrl(value, label) {
+  const url = String(value || '').trim().slice(0, 1000);
+  if (url && !/^https:\/\//i.test(url)) throw Error(`${label} يجب أن يبدأ بـ https://`);
+  return url;
+}
+
 async function throttle(env, key, limit = 10) {
   const t = Math.floor(Date.now() / 900000);
   const id = await hash(key + ':' + t);
@@ -171,10 +213,38 @@ export default {
     }
 
     try {
+      await ensureFeatureSchema(env);
       // =========================================
       // SERVE MEDIA FROM R2
       // =========================================
       const mediaMatch = path.match(/^\/api\/media\/([a-f0-9]{64}\.(?:png|jpeg|webp|gif))$/);
+      if (path === '/api/media' && req.method === 'POST') {
+        const user = await identity(req, env);
+        if (!user) {
+          return fail('سجّل الدخول أولاً حتى تتمكن من رفع صورة مشروعك.', 401);
+        }
+        if (!await throttle(env, user.id + ':media-upload', 24)) {
+          return fail('تم تجاوز عدد مرات رفع الصور. حاول لاحقًا.', 429);
+        }
+        const body = await readBody(req);
+        const dataUrl = String(body.imageData || '');
+        const match = /^data:image\/(png|jpeg|webp|gif);base64,([a-zA-Z0-9+/=]+)$/.exec(dataUrl);
+        if (!match) return fail('صيغة الصورة غير مدعومة. اختر PNG أو JPG أو WebP أو GIF.');
+        const binary = atob(match[2]);
+        if (binary.length > 8 * 1024 * 1024) return fail('حجم الصورة بعد المعالجة يجب ألا يتجاوز 8 ميغابايت.', 413);
+        const bucket = env.IMAGES || env.BUCKET || env.Bucket;
+        if (!bucket) return fail('تخزين الصور غير مهيأ على الخادم. اربط حاوية R2 باسم IMAGES.', 503);
+        const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        const key = hex(digest) + '.' + match[1];
+        await bucket.put('media/' + key, bytes, {
+          httpMetadata: {
+            contentType: 'image/' + match[1],
+            cacheControl: 'public, max-age=31536000, immutable'
+          }
+        });
+        return reply({ url: new URL('/api/media/' + key, req.url).href, key }, 201);
+      }
       if (mediaMatch && req.method === 'GET') {
         const bucket = env.IMAGES || env.BUCKET || env.Bucket;
         if (!bucket) return fail('تخزين الصور غير مهيأ على الخادم.', 503);
@@ -232,6 +302,203 @@ export default {
                 admin: !!user.is_admin
               }
             : null
+        });
+      }
+
+      // =========================================
+      // SITE RATINGS: public submission, admin-only review
+      // =========================================
+      if (path === '/api/ratings') {
+        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS site_ratings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+          comment TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL
+        )`).run();
+
+        if (req.method === 'POST') {
+          const ip = req.headers.get('cf-connecting-ip') || 'unknown';
+          if (!await throttle(env, ip + ':site-rating', 8)) {
+            return fail('تم استلام تقييمات كثيرة من هذا الاتصال. حاول لاحقًا.', 429);
+          }
+          const body = await readBody(req);
+          const stars = Number(body.stars);
+          const comment = String(body.comment || '').trim().slice(0, 1500);
+          if (!Number.isInteger(stars) || stars < 1 || stars > 5) {
+            return fail('اختر تقييمًا من نجمة إلى خمس نجوم.');
+          }
+          await env.DB.prepare(
+            'INSERT INTO site_ratings (stars, comment, created_at) VALUES (?, ?, ?)'
+          ).bind(stars, comment, Date.now()).run();
+          return reply({ success: true, message: 'شكرًا لك! تم استلام تقييمك.' }, 201);
+        }
+
+        if (req.method === 'GET') {
+          const user = await identity(req, env);
+          if (!user?.is_admin) return fail('عرض تقييمات الزوار متاح للإدارة فقط.', 403);
+          const [rows, summary] = await Promise.all([
+            env.DB.prepare('SELECT id, stars, comment, created_at FROM site_ratings ORDER BY created_at DESC LIMIT 500').all(),
+            env.DB.prepare('SELECT AVG(stars) AS average, COUNT(*) AS total FROM site_ratings').first()
+          ]);
+          return reply({
+            ratings: rows.results || [],
+            average: summary?.average ? Number(summary.average).toFixed(2) : 0,
+            total: Number(summary?.total || 0)
+          });
+        }
+
+        return fail('الطريقة غير مدعومة.', 405);
+      }
+
+      // =========================================
+      // COMMUNITY PROJECTS: signed-in user submissions, edits and moderation
+      // =========================================
+      if (path === '/api/community-projects') {
+        const user = await identity(req, env);
+        const params = new URL(req.url).searchParams;
+        const adminView = params.get('admin') === '1';
+        const ownView = params.get('mine') === '1';
+
+        if (req.method === 'GET') {
+          if (adminView) {
+            if (!user?.is_admin) return fail('هذه الصفحة للإدارة فقط.', 403);
+            const rows = await env.DB.prepare(`
+              SELECT p.*, u.name AS owner_name, u.email AS owner_email
+              FROM community_projects p JOIN users u ON u.id = p.user_id
+              ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END, p.created_at DESC
+              LIMIT 500
+            `).all();
+            return reply({ projects: rows.results || [] });
+          }
+          if (ownView) {
+            if (!user) return fail('سجّل الدخول لعرض مشاريعك.', 401);
+            const rows = await env.DB.prepare(`
+              SELECT id, title, field, project_type, description, image_url, phone, contact,
+                     instagram_url, facebook_url, entity_name, placement, status, admin_note,
+                     created_at, updated_at, reviewed_at
+              FROM community_projects WHERE user_id = ? ORDER BY created_at DESC LIMIT 100
+            `).bind(user.id).all();
+            return reply({ projects: rows.results || [] });
+          }
+          const rows = await env.DB.prepare(`
+            SELECT p.id, p.user_id, u.name AS owner_name, p.title, p.field, p.project_type,
+                   p.description, p.image_url, p.phone, p.contact, p.instagram_url,
+                   p.facebook_url, p.entity_name, p.placement, p.created_at, p.updated_at
+            FROM community_projects p JOIN users u ON u.id = p.user_id
+            WHERE p.status = 'approved'
+            ORDER BY COALESCE(p.reviewed_at, p.created_at) DESC, p.created_at DESC
+            LIMIT 300
+          `).all();
+          return reply({ projects: (rows.results || []).map(project => ({
+            ...project,
+            is_owner: !!user && project.user_id === user.id
+          })) });
+        }
+
+        if (req.method === 'POST' || req.method === 'PUT') {
+          if (!user) return fail('سجّل الدخول أولاً حتى تتمكن من إضافة أو تعديل مشروعك.', 401);
+          const body = await readBody(req);
+          const action = String(body.action || '').trim();
+
+          if (adminView || ['approve', 'reject', 'delete'].includes(action)) {
+            if (!user.is_admin) return fail('هذه العملية متاحة للإدارة فقط.', 403);
+            const id = String(body.id || '').trim();
+            if (!/^cp_[a-f0-9]{1,24}$/.test(id)) return fail('معرّف المشروع غير صالح.');
+            if (action === 'delete') {
+              const result = await env.DB.prepare('DELETE FROM community_projects WHERE id = ?').bind(id).run();
+              if (!result.meta.changes) return fail('المشروع غير موجود.', 404);
+              return reply({ success: true, message: 'تم حذف المشروع.' });
+            }
+            const status = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : '';
+            if (!status) return fail('إجراء الإدارة غير صالح.');
+            const note = String(body.note || '').trim().slice(0, 500);
+            const result = await env.DB.prepare(`UPDATE community_projects SET status = ?, admin_note = ?, reviewed_at = ?, updated_at = ? WHERE id = ?`)
+              .bind(status, note, Date.now(), Date.now(), id).run();
+            if (!result.meta.changes) return fail('المشروع غير موجود.', 404);
+            return reply({ success: true, message: status === 'approved' ? 'تم قبول المشروع ونشره في الأقسام المحددة.' : 'تم رفض المشروع.' });
+          }
+
+          // Every authenticated account may submit and manage its own projects.
+          const title = String(body.title || '').trim().slice(0, 120);
+          const field = String(body.field || '').trim().slice(0, 100);
+          const projectType = String(body.projectType || '').trim().slice(0, 40);
+          const description = String(body.description || '').trim().slice(0, 2000);
+          let imageUrl = '', instagramUrl = '', facebookUrl = '';
+          try {
+            imageUrl = validOptionalUrl(body.imageUrl, 'رابط الصورة');
+            instagramUrl = validOptionalUrl(body.instagramUrl, 'رابط إنستغرام');
+            facebookUrl = validOptionalUrl(body.facebookUrl, 'رابط فيسبوك');
+          } catch (validationError) {
+            return fail(validationError.message, 400);
+          }
+          const phone = String(body.phone || '').trim().slice(0, 40);
+          const contact = String(body.contact || '').trim().slice(0, 160);
+          const entityName = String(body.entityName || '').trim().slice(0, 120);
+          const placement = String(body.placement || 'projects').trim();
+          if (!title || !field || !projectType || description.length < 10) {
+            return fail('أكمل اسم المشروع والمجال والنوع والوصف (10 أحرف على الأقل).');
+          }
+          if (!['منتج', 'خدمة', 'فكرة إبداعية', 'مبادرة'].includes(projectType)) return fail('نوع المشروع غير صالح.');
+          if (!COMMUNITY_PLACEMENTS.has(placement)) return fail('طريقة نشر المشروع غير صالحة.');
+
+          if (action === 'update' || req.method === 'PUT') {
+            const id = String(body.id || '').trim();
+            if (!/^cp_[a-f0-9]{1,24}$/.test(id)) return fail('معرّف المشروع غير صالح.');
+            const owned = await env.DB.prepare('SELECT id, status FROM community_projects WHERE id = ? AND user_id = ?').bind(id, user.id).first();
+            if (!owned) return fail('لا يمكنك تعديل هذا المشروع.', 403);
+            const now = Date.now();
+            const nextStatus = owned.status === 'approved' ? 'approved' : 'pending';
+            const adminNote = owned.status === 'rejected' ? '' : null;
+            await env.DB.prepare(`
+              UPDATE community_projects SET title=?, field=?, project_type=?, description=?, image_url=?,
+                phone=?, contact=?, instagram_url=?, facebook_url=?, entity_name=?, placement=?,
+                status=?, admin_note=COALESCE(?, admin_note), reviewed_at=CASE WHEN ?='approved' THEN reviewed_at ELSE NULL END,
+                updated_at=? WHERE id=? AND user_id=?
+            `).bind(title, field, projectType, description, imageUrl, phone, contact, instagramUrl, facebookUrl,
+              entityName, placement, nextStatus, adminNote, nextStatus, now, id, user.id).run();
+            return reply({ success: true, message: owned.status === 'approved' ? 'تم تحديث مشروعك المنشور على الموقع.' : 'تم حفظ التعديلات وإرسال المشروع مجددًا للمراجعة.' });
+          }
+
+          if (!await throttle(env, user.id + ':community-project-submit', 8)) return fail('أرسلت طلبات كثيرة. حاول لاحقاً.', 429);
+          const id = 'cp_' + random().slice(0, 24);
+          const now = Date.now();
+          await env.DB.prepare(`
+            INSERT INTO community_projects
+              (id,user_id,title,field,project_type,description,image_url,phone,contact,instagram_url,facebook_url,entity_name,placement,status,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)
+          `).bind(id,user.id,title,field,projectType,description,imageUrl,phone,contact,instagramUrl,facebookUrl,entityName,placement,now,now).run();
+          return reply({ success: true, id, message: 'تم إرسال مشروعك إلى الإدارة. سيظهر في الأقسام التي اخترتها بعد الموافقة.' }, 201);
+        }
+        return fail('الطريقة غير مدعومة.', 405);
+      }
+
+      // =========================================
+      // SITE STATISTICS: all member accounts, plus distinct accounts that
+      // have submitted at least one community project (a subset of all users).
+      // Pending, approved and rejected submissions all count as participation.
+      // =========================================
+      if (path === '/api/statistics' && req.method === 'GET') {
+        const [usersRow, projectAccountsRow, projectsRow] = await Promise.all([
+          env.DB.prepare('SELECT COUNT(*) AS total FROM users WHERE is_admin = 0').first(),
+          env.DB.prepare(`
+            SELECT COUNT(DISTINCT p.user_id) AS total
+            FROM community_projects p
+            JOIN users u ON u.id = p.user_id
+            WHERE u.is_admin = 0
+          `).first(),
+          env.DB.prepare(`
+            SELECT COUNT(*) AS total FROM community_projects p
+            JOIN users u ON u.id = p.user_id WHERE u.is_admin = 0
+          `).first()
+        ]);
+        const usersTotal = Number(usersRow?.total || 0);
+        const accountsWithProjects = Number(projectAccountsRow?.total || 0);
+        return reply({
+          usersTotal,
+          users: usersTotal,
+          accountsWithProjects,
+          projectSubmitters: accountsWithProjects,
+          submittedProjects: Number(projectsRow?.total || 0)
         });
       }
 
@@ -946,6 +1213,8 @@ export default {
 
       // SIGNUP
       if (path === '/api/signup') {
+        // All member accounts are the same type. Project submission rights
+        // depend only on being authenticated, not on a registration choice.
         if (
           !strongPassword(b.password)
         ) {
@@ -955,40 +1224,65 @@ export default {
         }
 
         const exists = await env.DB.prepare(
-          'SELECT id FROM users WHERE email = ?'
+          'SELECT id, email, name, salt, password_hash, is_admin FROM users WHERE email = ?'
         ).bind(email).first();
 
         if (exists) {
+          // A previous signup attempt may already have created the account
+          // before the browser finished storing its session. Treat a repeat
+          // signup with the same credentials as a sign-in, never as a fake
+          // successful signup without a token.
+          const candidate = await derive(String(b.password || ''), exists.salt);
+          if (candidate !== exists.password_hash) {
+            return fail('هذا البريد الإلكتروني مسجل مسبقًا. كلمة المرور لا تطابق الحساب الحالي؛ سجّل الدخول بكلمة المرور الأصلية أو استخدم استعادة كلمة المرور.', 409);
+          }
+
+          const token = random();
+          const expiresAt = Date.now() + 7 * 86400000;
+          await env.DB.prepare(
+            'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)'
+          ).bind(await hash(token), exists.id, expiresAt).run();
+
           return reply({
-            message:
-              'إذا كان البريد غير مستخدم، يمكنك تسجيل الدخول بعد إنشاء الحساب.'
-          });
+            message: 'هذا الحساب موجود بالفعل. تم تسجيل دخولك بنجاح.',
+            token,
+            expiresIn: 604800,
+            user: {
+              id: exists.id,
+              email: exists.email,
+              name: exists.name || '',
+              admin: !!exists.is_admin
+            }
+          }, 200, { 'set-cookie': cookie(token, 604800) });
         }
 
         const salt = random();
-        const password_hash = await derive(
-          b.password,
-          salt
-        );
-
-        await env.DB.prepare(`
-          INSERT INTO users
-            (id, email, name, salt, password_hash, is_admin)
-          VALUES (?, ?, ?, ?, ?, 0)
-        `).bind(
-          crypto.randomUUID(),
-          email,
-          String(b.name || '').trim().slice(0, 100),
-          salt,
-          password_hash
-        ).run();
-
-        const newUser = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+        const password_hash = await derive(b.password, salt);
+        const userId = crypto.randomUUID();
         const token = random();
-        await env.DB.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
-          .bind(await hash(token), newUser.id, Date.now() + 7 * 86400000).run();
-        return reply({ message: 'تم إنشاء الحساب وتسجيل دخولك بنجاح.', token, expiresIn: 604800 }, 200,
-          { 'set-cookie': cookie(token, 604800) });
+        const tokenHash = await hash(token);
+        const expiresAt = Date.now() + 7 * 86400000;
+        const name = String(b.name || '').trim().slice(0, 100);
+
+        // Create the account and its first session atomically. A successful
+        // signup therefore always has a usable login token to return.
+        await env.DB.batch([
+          env.DB.prepare(`
+            INSERT INTO users
+              (id, email, name, salt, password_hash, is_admin)
+            VALUES (?, ?, ?, ?, ?, 0)
+          `).bind(userId, email, name, salt, password_hash),
+          env.DB.prepare(
+            'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)'
+          ).bind(tokenHash, userId, expiresAt)
+        ]);
+
+        return reply({
+          message: 'تم إنشاء الحساب وتسجيل دخولك بنجاح.',
+          token,
+          expiresIn: 604800,
+          user: { id: userId, email, name, admin: false }
+        }, 201, { 'set-cookie': cookie(token, 604800) });
       }
 
       // NORMAL LOGIN
@@ -1019,7 +1313,12 @@ export default {
         ).run();
 
         return reply(
-          { message: 'تم تسجيل الدخول', token, expiresIn: 604800 },
+          {
+            message: 'تم تسجيل الدخول',
+            token,
+            expiresIn: 604800,
+            user: { id: row.id, email: row.email, name: row.name || '', admin: !!row.is_admin }
+          },
           200,
           { 'set-cookie': cookie(token, 604800) }
         );
